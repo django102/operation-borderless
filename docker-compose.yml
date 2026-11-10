@@ -1,0 +1,51 @@
+name: borderless
+
+x-api-env: &api-env
+  DATABASE_URL: postgres://borderless:borderless@db:5432/borderless
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # Set FX_PROVIDER=static to run without internet access.
+  FX_PROVIDER: ${FX_PROVIDER:-live}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: borderless
+      POSTGRES_PASSWORD: borderless
+      POSTGRES_DB: borderless
+    ports:
+      - '${DB_PORT:-5432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U borderless -d borderless']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: applies migrations, then exits. The API only starts once this succeeds.
+  migrate:
+    build: .
+    image: borderless-api:local
+    command: ['node', 'dist/db/migrate.js']
+    environment: *api-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build: .
+    image: borderless-api:local
+    environment:
+      <<: *api-env
+      PORT: 3000
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
