@@ -1,0 +1,485 @@
+openapi: 3.0.3
+info:
+  title: Harmattan API (Operation Borderless)
+  version: 1.0.0
+  description: |
+    **Harmattan** is a stablecoin-powered cross-border payments sandbox: multi-currency wallets,
+    simulated deposits, FX swaps and cross-currency transfers between wallets.
+
+    ### Conventions
+    - **Amounts are decimal strings** with up to 6 decimal places (e.g. `"1500.25"`), returned
+      with a fixed scale of 6 (`"1500.250000"`). JSON numbers are accepted on input but strings
+      are recommended so no client-side float rounding can sneak in.
+    - **Idempotency:** every money-moving `POST` requires an `Idempotency-Key` header. Retrying
+      with the same key and the same body returns the original result (header
+      `Idempotent-Replayed: true`) and moves no money. Reusing a key with a different body
+      returns `422 IDEMPOTENCY_KEY_REUSED`. Keys are scoped to the initiating wallet.
+    - **FX rates** come from a live provider, falling back to the last-known-good snapshot and
+      then a static table. Every rate and every transaction says which source priced it.
+    - **Errors** have the shape `{ "error": { "code", "message", "details"? } }`.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Wallets
+  - name: Money movement
+  - name: History
+  - name: FX
+  - name: System
+
+paths:
+  /v1/wallets:
+    post:
+      tags: [Wallets]
+      summary: Create a wallet
+      description: |
+        Creates a wallet identified by an email address and/or a mobile number, with a zero
+        balance in every supported stablecoin. Emails are case-insensitive and phone numbers are
+        normalised to E.164, so the same person cannot create two wallets by changing format.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWalletRequest' }
+            examples:
+              email: { value: { email: 'ada@example.com' } }
+              phone: { value: { phone: '+234 803 123 4567' } }
+      responses:
+        '201':
+          description: Wallet created
+          headers:
+            Location: { schema: { type: string }, description: URL of the new wallet }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Wallet' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: A wallet with this email or phone already exists
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: WALLET_ALREADY_EXISTS
+                  message: A wallet with this email already exists.
+                  details: { field: email }
+
+  /v1/wallets/{walletId}:
+    get:
+      tags: [Wallets]
+      summary: Get a wallet with its balances and USD total
+      parameters: [{ $ref: '#/components/parameters/WalletId' }]
+      responses:
+        '200':
+          description: The wallet
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Wallet' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+
+  /v1/wallets/{walletId}/balances:
+    get:
+      tags: [Wallets]
+      summary: Get balances and their total value in USD
+      description: |
+        Balances are always returned. If no trustworthy FX rate is available (provider down,
+        no recent snapshot, static fallback disabled), `usdValue`, `totalUsd` and `valuation` are
+        `null` rather than the request failing.
+      parameters: [{ $ref: '#/components/parameters/WalletId' }]
+      responses:
+        '200':
+          description: Balances
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balances' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+
+  /v1/wallets/{walletId}/deposits:
+    post:
+      tags: [Money movement]
+      summary: Deposit funds (simulated)
+      parameters:
+        - { $ref: '#/components/parameters/WalletId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [currency, amount]
+              properties:
+                currency: { $ref: '#/components/schemas/Currency' }
+                amount: { $ref: '#/components/schemas/AmountInput' }
+            example: { currency: cNGN, amount: '250000' }
+      responses:
+        '201': { $ref: '#/components/responses/TransactionCreated' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /v1/wallets/{walletId}/swaps:
+    post:
+      tags: [Money movement]
+      summary: Swap one stablecoin for another inside the wallet
+      description: |
+        Debits `amount` of `fromCurrency` and credits the converted amount of `toCurrency` at the
+        current rate. The credited amount is rounded **down** to 6 decimal places.
+      parameters:
+        - { $ref: '#/components/parameters/WalletId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fromCurrency, toCurrency, amount]
+              properties:
+                fromCurrency: { $ref: '#/components/schemas/Currency' }
+                toCurrency: { $ref: '#/components/schemas/Currency' }
+                amount: { $ref: '#/components/schemas/AmountInput' }
+            example: { fromCurrency: cNGN, toCurrency: USDx, amount: '150000' }
+      responses:
+        '201': { $ref: '#/components/responses/TransactionCreated' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+        '503': { $ref: '#/components/responses/FxUnavailable' }
+
+  /v1/wallets/{walletId}/transfers:
+    post:
+      tags: [Money movement]
+      summary: Send funds to another wallet, optionally converting currency
+      description: |
+        Debits `amount` of `sourceCurrency` from this wallet and credits the receiver in
+        `destinationCurrency` (defaults to `sourceCurrency`). Cross-currency transfers are
+        converted at the current rate; the rate applied is stored on the transaction.
+      parameters:
+        - { $ref: '#/components/parameters/WalletId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [toWalletId, sourceCurrency, amount]
+              properties:
+                toWalletId: { type: string, format: uuid }
+                sourceCurrency: { $ref: '#/components/schemas/Currency' }
+                destinationCurrency: { $ref: '#/components/schemas/Currency' }
+                amount: { $ref: '#/components/schemas/AmountInput' }
+            example:
+              toWalletId: 6b1d4f0e-8a51-4d6a-9d5e-2c1f3a7b9e10
+              sourceCurrency: USDx
+              destinationCurrency: cGHS
+              amount: '25'
+      responses:
+        '201': { $ref: '#/components/responses/TransactionCreated' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+        '503': { $ref: '#/components/responses/FxUnavailable' }
+
+  /v1/wallets/{walletId}/transactions:
+    get:
+      tags: [History]
+      summary: List a wallet's transactions, newest first
+      description: |
+        Includes deposits, swaps, and transfers both sent and received (see `direction`).
+        Keyset pagination: pass `pagination.nextCursor` as `cursor` to get the next page.
+      parameters:
+        - { $ref: '#/components/parameters/WalletId' }
+        - name: type
+          in: query
+          description: One type or a comma-separated list (case-insensitive).
+          schema: { type: string, example: 'SWAP,TRANSFER' }
+        - name: currency
+          in: query
+          description: |
+            Only transactions that moved this currency **in this wallet**. A USDx to cGHS transfer
+            is a USDx transaction for the sender and a cGHS transaction for the receiver.
+          schema: { $ref: '#/components/schemas/Currency' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: A page of transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  pagination:
+                    type: object
+                    required: [limit, hasMore, nextCursor]
+                    properties:
+                      limit: { type: integer }
+                      hasMore: { type: boolean }
+                      nextCursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/WalletNotFound' }
+
+  /v1/transactions/{transactionId}:
+    get:
+      tags: [History]
+      summary: Get a single transaction
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The transaction
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404':
+          description: Transaction not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/fx/rates:
+    get:
+      tags: [FX]
+      summary: Current conversion rates between all supported stablecoins
+      responses:
+        '200':
+          description: All 20 ordered pairs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [base, source, provider, refreshedAt, rates]
+                properties:
+                  base: { $ref: '#/components/schemas/Currency' }
+                  source: { $ref: '#/components/schemas/RateSource' }
+                  provider: { type: string, example: open.er-api.com }
+                  refreshedAt: { type: string, format: date-time }
+                  rates:
+                    type: array
+                    items: { $ref: '#/components/schemas/Rate' }
+        '503': { $ref: '#/components/responses/FxUnavailable' }
+
+  /v1/fx/quote:
+    get:
+      tags: [FX]
+      summary: Price a conversion without moving money
+      parameters:
+        - {
+            name: from,
+            in: query,
+            required: true,
+            schema: { $ref: '#/components/schemas/Currency' },
+          }
+        - { name: to, in: query, required: true, schema: { $ref: '#/components/schemas/Currency' } }
+        - { name: amount, in: query, required: true, schema: { type: string, example: '1000' } }
+      responses:
+        '200':
+          description: Quote
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Rate' }
+                  - type: object
+                    properties:
+                      sourceAmount: { $ref: '#/components/schemas/Amount' }
+                      destinationAmount: { $ref: '#/components/schemas/Amount' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/FxUnavailable' }
+
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness and database connectivity
+      responses:
+        '200': { description: Healthy }
+        '503': { description: Database unreachable }
+
+components:
+  parameters:
+    WalletId:
+      name: walletId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique per operation, 1-255 characters of `[A-Za-z0-9_.:-]`. A UUID works well.
+      schema: { type: string, example: 3f0c9a52-6c7e-4d0b-9a3a-1c2b3d4e5f60 }
+
+  responses:
+    TransactionCreated:
+      description: |
+        Operation completed (or replayed: `Idempotent-Replayed: true` means an earlier request
+        with the same key already did it and no money moved this time).
+      headers:
+        Idempotent-Replayed: { schema: { type: string, enum: ['true', 'false'] } }
+        Location: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transaction' }
+    ValidationError:
+      description: Malformed request, missing Idempotency-Key, same-currency swap or self-transfer
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: The request is invalid.
+              details: [{ path: amount, message: must have at most 6 decimal places }]
+    WalletNotFound:
+      description: Wallet not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BusinessRuleError:
+      description: INSUFFICIENT_FUNDS, AMOUNT_TOO_SMALL or IDEMPOTENCY_KEY_REUSED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: INSUFFICIENT_FUNDS
+              message: Insufficient USDx balance.
+              details: { currency: USDx, available: '10.000000', required: '25.000000' }
+    FxUnavailable:
+      description: No trustworthy FX rate is available
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Currency:
+      type: string
+      enum: [cNGN, cGHS, cXAF, USDx, EURx]
+    Amount:
+      type: string
+      description: Decimal string with exactly 6 decimal places
+      example: '1500.000000'
+    AmountInput:
+      description: Positive decimal with at most 6 decimal places and no exponent. Strings recommended.
+      oneOf:
+        - { type: string, example: '1500.25' }
+        - { type: number }
+    RateSource:
+      type: string
+      enum: [live, cached, static]
+      description: |
+        `live`: fetched from the provider. `cached`: last-known-good snapshot from the database
+        (provider down). `static`: hard-coded fallback table.
+    Rate:
+      type: object
+      required: [from, to, rate, source, refreshedAt]
+      properties:
+        from: { $ref: '#/components/schemas/Currency' }
+        to: { $ref: '#/components/schemas/Currency' }
+        rate:
+          {
+            type: string,
+            example: '0.000741250000000000',
+            description: 'Units of `to` per 1 `from`',
+          }
+        source: { $ref: '#/components/schemas/RateSource' }
+        refreshedAt: { type: string, format: date-time }
+    CreateWalletRequest:
+      type: object
+      additionalProperties: false
+      description: At least one of `email` or `phone` is required.
+      properties:
+        email: { type: string, format: email }
+        phone: { type: string, description: International format, e.g. +2348031234567 }
+    Balance:
+      type: object
+      required: [currency, amount, usdValue]
+      properties:
+        currency: { $ref: '#/components/schemas/Currency' }
+        amount: { $ref: '#/components/schemas/Amount' }
+        usdValue: { allOf: [{ $ref: '#/components/schemas/Amount' }], nullable: true }
+    Valuation:
+      type: object
+      nullable: true
+      properties:
+        rateSource: { $ref: '#/components/schemas/RateSource' }
+        ratesRefreshedAt: { type: string, format: date-time }
+    Balances:
+      type: object
+      required: [walletId, balances, totalUsd, valuation]
+      properties:
+        walletId: { type: string, format: uuid }
+        balances: { type: array, items: { $ref: '#/components/schemas/Balance' } }
+        totalUsd: { allOf: [{ $ref: '#/components/schemas/Amount' }], nullable: true }
+        valuation: { $ref: '#/components/schemas/Valuation' }
+    Wallet:
+      type: object
+      required: [id, email, phone, createdAt, balances, totalUsd, valuation]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        balances: { type: array, items: { $ref: '#/components/schemas/Balance' } }
+        totalUsd: { allOf: [{ $ref: '#/components/schemas/Amount' }], nullable: true }
+        valuation: { $ref: '#/components/schemas/Valuation' }
+    Transaction:
+      type: object
+      required: [id, type, status, walletId, source, destination, fx, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [DEPOSIT, SWAP, TRANSFER] }
+        status: { type: string, enum: [COMPLETED] }
+        walletId: { type: string, format: uuid, description: The wallet that initiated it }
+        senderWalletId: { type: string, format: uuid, description: Transfers only }
+        receiverWalletId: { type: string, format: uuid, description: Transfers only }
+        direction:
+          type: string
+          enum: [SENT, RECEIVED]
+          description: Transfers only, and only in a wallet's history
+        source:
+          type: object
+          properties:
+            currency: { $ref: '#/components/schemas/Currency' }
+            amount: { $ref: '#/components/schemas/Amount' }
+        destination:
+          type: object
+          properties:
+            currency: { $ref: '#/components/schemas/Currency' }
+            amount: { $ref: '#/components/schemas/Amount' }
+        fx:
+          type: object
+          properties:
+            rate: { type: string }
+            source: { type: string, enum: [identity, live, cached, static] }
+            asOf: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
